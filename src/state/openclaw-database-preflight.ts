@@ -18,7 +18,11 @@ import {
   collectSqliteSchemaIssues,
   type SqliteSchemaIssue,
 } from "../infra/sqlite-schema-contract.js";
-import { prepareSqliteReadOnlyLocation } from "../infra/sqlite-snapshot-source.js";
+import { readSqliteWriterAppVersion as readWriterAppVersion } from "../infra/sqlite-schema-header.js";
+import {
+  inspectSqliteSchemaHeader,
+  prepareSqliteReadOnlyLocation,
+} from "../infra/sqlite-snapshot-source.js";
 import { readSqliteUserVersion, SqliteSchemaVersionError } from "../infra/sqlite-user-version.js";
 import { discoverAgentDatabaseMigrationTargets } from "../infra/state-migrations.media-persistence-targets.js";
 import { isValidAgentId } from "../routing/session-key.js";
@@ -30,6 +34,7 @@ import {
 } from "./agent-database-admission.js";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "./openclaw-agent-db-contract.js";
 import { assertOpenClawAgentDatabaseForMaintenance } from "./openclaw-agent-db-maintenance.js";
+import type { ExistingAgentSchemaMeta } from "./openclaw-agent-db-metadata.js";
 import { isPersistentOpenClawAgentDatabasePath } from "./openclaw-agent-db-registry.js";
 import {
   assertCanonicalAgentPersistenceVersion,
@@ -174,19 +179,6 @@ export async function assertOpenClawDatabasesReady(
     return;
   }
   throw new Error(formatIndeterminateDatabaseReadiness(schemas.indeterminate, options.operation));
-}
-
-function readWriterAppVersion(database: DatabaseSync): string | undefined {
-  try {
-    const row = database
-      .prepare("SELECT app_version FROM schema_meta WHERE meta_key = 'primary' LIMIT 1")
-      .get() as { app_version?: unknown } | undefined;
-    return typeof row?.app_version === "string" && row.app_version.length > 0
-      ? row.app_version
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function readRegisteredAgentDatabases(
@@ -586,27 +578,43 @@ export async function preflightOpenClawDatabaseSchemas(options: {
       }
       inspectedAgentPaths.add(realAgentPath);
       inspectedAgentTargets.add(inspectionKey);
-      // Live agents keep committing during inspection. Online backup preserves
-      // database/WAL contents while allowing SQLite to update SHM read marks.
-      agentSnapshot = await prepareSqliteReadOnlyLocation(realAgentPath, {
-        signal: options.signal,
-      });
-      options.signal?.throwIfAborted();
-      agentDatabase = openNodeSqliteDatabase(agentSnapshot.location, {
-        readOnly: true,
-      });
-      agentDatabase.exec(`PRAGMA busy_timeout = ${OPENCLAW_SQLITE_BUSY_TIMEOUT_MS};`);
-      const agentVersion = readSqliteUserVersion(agentDatabase);
-      if (
-        agentVersion <= options.supportedVersions.agent &&
-        options.agentAdmissionConfig &&
-        row.agentId &&
-        listAgentIds(options.agentAdmissionConfig).includes(row.agentId)
-      ) {
+      let agentVersion: number;
+      let writerAppVersion: string | undefined;
+      let agentSchemaMeta: ExistingAgentSchemaMeta | null | undefined;
+      const inspectOwnership =
+        options.agentAdmissionConfig !== undefined &&
+        row.agentId !== undefined &&
+        listAgentIds(options.agentAdmissionConfig).includes(row.agentId);
+      if (!options.requireStartupMigrationReadiness && !options.verifyCurrentSchemaShape) {
+        const header = await inspectSqliteSchemaHeader(realAgentPath, {
+          signal: options.signal,
+          ...(inspectOwnership
+            ? { agentSchemaVersionForOwnership: options.supportedVersions.agent }
+            : {}),
+        });
+        options.signal?.throwIfAborted();
+        agentVersion = header.userVersion;
+        writerAppVersion = header.writerAppVersion;
+        agentSchemaMeta = header.agentSchemaMeta;
+      } else {
+        // Full readiness retains its private snapshot; diagnostics need only bounded metadata.
+        agentSnapshot = await prepareSqliteReadOnlyLocation(realAgentPath, {
+          signal: options.signal,
+        });
+        options.signal?.throwIfAborted();
+        agentDatabase = openNodeSqliteDatabase(agentSnapshot.location, { readOnly: true });
+        agentDatabase.exec(`PRAGMA busy_timeout = ${OPENCLAW_SQLITE_BUSY_TIMEOUT_MS};`);
+        agentVersion = readSqliteUserVersion(agentDatabase);
+        writerAppVersion = readWriterAppVersion(agentDatabase);
+        if (inspectOwnership && agentVersion <= options.supportedVersions.agent) {
+          agentSchemaMeta = readExistingAgentSchemaMeta(agentDatabase);
+        }
+      }
+      if (agentVersion <= options.supportedVersions.agent && inspectOwnership && row.agentId) {
         const refusal = inspectAgentDatabaseAdmission({
           agentId: row.agentId,
           path: agentPath,
-          metadata: readExistingAgentSchemaMeta(agentDatabase),
+          metadata: agentSchemaMeta ?? null,
         });
         if (refusal) {
           (result.agentRefusals ??= []).push(refusal);
@@ -622,7 +630,16 @@ export async function preflightOpenClawDatabaseSchemas(options: {
           supportedVersion: options.supportedVersions.agent,
         });
       }
-      if (agentVersion <= options.supportedVersions.agent) {
+      if (agentVersion > options.supportedVersions.agent) {
+        result.incompatible.push({
+          kind: "agent",
+          path: agentPath,
+          ...(row.agentId !== undefined ? { agentId: row.agentId } : {}),
+          foundVersion: agentVersion,
+          supportedVersion: options.supportedVersions.agent,
+          ...(writerAppVersion ? { writerAppVersion } : {}),
+        });
+      } else if (agentDatabase) {
         if (options.requireStartupMigrationReadiness) {
           assertSqliteIntegrity(agentDatabase, agentPath);
           assertCanonicalAgentPersistenceVersion(agentDatabase, agentPath, agentVersion);
@@ -642,17 +659,7 @@ export async function preflightOpenClawDatabaseSchemas(options: {
             pathname: agentPath,
           });
         }
-        continue;
       }
-      const writerAppVersion = readWriterAppVersion(agentDatabase);
-      result.incompatible.push({
-        kind: "agent",
-        path: agentPath,
-        ...(row.agentId !== undefined ? { agentId: row.agentId } : {}),
-        foundVersion: agentVersion,
-        supportedVersion: options.supportedVersions.agent,
-        ...(writerAppVersion ? { writerAppVersion } : {}),
-      });
     } catch (error) {
       if (options.signal?.aborted || options.requireStartupMigrationReadiness) {
         throw error;

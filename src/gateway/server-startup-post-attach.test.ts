@@ -12,7 +12,7 @@ import {
 import { createDeferred } from "../../test/helpers/promise.js";
 import * as configPaths from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { writeRestartSentinel } from "../infra/restart-sentinel.js";
+import { hasRestartSentinel, writeRestartSentinel } from "../infra/restart-sentinel.js";
 import type { PluginHookGatewayContext, PluginHookHandlerMap } from "../plugins/hook-types.js";
 import { createHookRunner } from "../plugins/hooks.js";
 import { createMockPluginRegistry } from "../plugins/hooks.test-fixtures.js";
@@ -1493,9 +1493,9 @@ describe("startGatewayPostAttachRuntime", () => {
       );
 
       expect(
-        await testing.hasRestartSentinelFast({
+        await hasRestartSentinel({
           OPENCLAW_STATE_DIR: stateDir,
-        } as NodeJS.ProcessEnv),
+        }),
       ).toBe(true);
     } finally {
       closeOpenClawStateDatabaseForTest();
@@ -1523,9 +1523,9 @@ describe("startGatewayPostAttachRuntime", () => {
       });
       try {
         await expect(
-          testing.hasRestartSentinelFast({
+          hasRestartSentinel({
             OPENCLAW_STATE_DIR: stateDir,
-          } as NodeJS.ProcessEnv),
+          }),
         ).resolves.toBe(true);
         expect(
           existsSync.mock.calls.filter((call) => String(call[0]).startsWith(stateDir)),
@@ -2423,37 +2423,78 @@ describe("startGatewayPostAttachRuntime", () => {
     }
   });
 
-  it("publishes plugin cleanup ownership before lazy service loading", async () => {
-    let shouldStartPluginServices = true;
-    let stopping: ReturnType<PluginServicesHandle["stop"]> | undefined;
-    const onPluginServices = vi.fn((handle: PluginServicesHandle | null) => {
-      if (!handle) {
-        return;
+  it.each(["Gateway close", "plugin replacement"] as const)(
+    "settles deferred plugin cleanup during %s before lazy service loading",
+    async (boundary) => {
+      const generation = createPluginServicesOwner();
+      const startupClaim = generation.currentClaim();
+      const replacementWaitEntered = createDeferred();
+      let reservation: ReturnType<typeof generation.reserve> | undefined;
+      let shouldStartPluginServices = true;
+      let stopping: ReturnType<PluginServicesHandle["stop"]> | undefined;
+      let stopped = false;
+      const stopPublishedServices = () => {
+        const handle = generation.currentServices();
+        if (!handle) {
+          throw new Error("plugin service cleanup owner was not published");
+        }
+        shouldStartPluginServices = false;
+        stopping = handle.stop().then(() => {
+          stopped = true;
+        });
+      };
+      const onPluginServices = vi.fn((handle: PluginServicesHandle | null) => {
+        if (!handle) {
+          return;
+        }
+        generation.publishServices(startupClaim, handle);
+        if (boundary === "plugin replacement") {
+          reservation = generation.reserve();
+        } else {
+          stopPublishedServices();
+        }
+      });
+
+      const starting = startGatewaySidecars({
+        cfg: { hooks: { internal: { enabled: false } } } as never,
+        pluginRegistry: createPostAttachParams().pluginRegistry,
+        pluginRuntimeClaim: {
+          ...startupClaim,
+          waitForUnblocked: () => {
+            const waiting = startupClaim.waitForUnblocked();
+            if (reservation) {
+              replacementWaitEntered.resolve();
+            }
+            return waiting;
+          },
+        },
+        defaultWorkspaceDir: testState.workspaceDir,
+        deps: {} as never,
+        startChannels: vi.fn(async () => {}),
+        shouldStartPluginServices: () => shouldStartPluginServices,
+        onPluginServices,
+        log: { warn: vi.fn() },
+        logHooks: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+        logChannels: { info: vi.fn(), error: vi.fn() },
+      });
+
+      try {
+        if (boundary === "plugin replacement") {
+          await replacementWaitEntered.promise;
+          stopPublishedServices();
+        }
+        // Replacement can settle its reservation only after the previous owner drains.
+        await waitForGatewayTestState(() => expect(stopped).toBe(true));
+        reservation?.commit();
+        await starting;
+        expect(hoisted.startPluginServices).not.toHaveBeenCalled();
+        expect(onPluginServices).toHaveBeenCalledOnce();
+      } finally {
+        reservation?.reject();
+        await Promise.allSettled([starting, stopping]);
       }
-      shouldStartPluginServices = false;
-      stopping = handle.stop();
-    });
-
-    await startGatewaySidecars({
-      cfg: { hooks: { internal: { enabled: false } } } as never,
-      pluginRegistry: createPostAttachParams().pluginRegistry,
-      defaultWorkspaceDir: testState.workspaceDir,
-      deps: {} as never,
-      startChannels: vi.fn(async () => {}),
-      shouldStartPluginServices: () => shouldStartPluginServices,
-      onPluginServices,
-      log: { warn: vi.fn() },
-      logHooks: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
-      logChannels: { info: vi.fn(), error: vi.fn() },
-    });
-
-    if (!stopping) {
-      throw new Error("plugin service cleanup owner was not published");
-    }
-    await stopping;
-    expect(hoisted.startPluginServices).not.toHaveBeenCalled();
-    expect(onPluginServices).toHaveBeenCalledOnce();
-  });
+    },
+  );
 
   it.each(["settles", "times out", "has no deadline"] as const)(
     "forwards strict cleanup through the deferred plugin service owner when it %s",
@@ -4917,12 +4958,10 @@ describe("startGatewayPostAttachRuntime", () => {
       } as never,
     });
 
-    await startGatewayPostAttachRuntime(
-      params,
-      createPostAttachRuntimeDeps({
-        createHookRunner: vi.fn(async () => hookRunner as never),
-      }),
-    );
+    const runtimeDeps = createPostAttachRuntimeDeps({
+      createHookRunner: vi.fn(async () => hookRunner as never),
+    });
+    await startGatewayPostAttachRuntime(params, runtimeDeps);
 
     await waitForGatewayTestState(() => {
       expect(runGatewayStart).toHaveBeenCalledTimes(1);
@@ -4933,10 +4972,14 @@ describe("startGatewayPostAttachRuntime", () => {
       throw new Error("gateway_start context did not expose getCron");
     }
     expect(ctx.getCron()).toBe(liveCron);
+    const serviceGetter = vi.mocked(runtimeDeps.startGatewaySidecars).mock.calls[0]?.[0]
+      .getCronService;
+    expect(serviceGetter?.()).toBe(liveCron);
 
     params.deps.cron = depsCron as never;
     currentLiveCron = reloadedCron;
     expect(ctx.getCron()).toBe(reloadedCron);
+    expect(serviceGetter?.()).toBe(reloadedCron);
   });
 });
 

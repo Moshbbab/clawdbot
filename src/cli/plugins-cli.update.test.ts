@@ -37,34 +37,10 @@ import {
   writePersistedInstalledPluginIndexInstallRecordsWithLeaseMock,
 } from "./plugins-cli-test-helpers.js";
 import { registerPluginsCli } from "./plugins-cli.js";
+import { createCliTtyMock } from "./test-runtime-capture.js";
 
 const ORIGINAL_OPENCLAW_NIX_MODE = process.env.OPENCLAW_NIX_MODE;
-const ORIGINAL_STDIN_TTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
-const ORIGINAL_STDOUT_TTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-
-function setTty(value: boolean): void {
-  Object.defineProperty(process.stdin, "isTTY", {
-    value,
-    configurable: true,
-  });
-  Object.defineProperty(process.stdout, "isTTY", {
-    value,
-    configurable: true,
-  });
-}
-
-function restoreTty(): void {
-  if (ORIGINAL_STDIN_TTY) {
-    Object.defineProperty(process.stdin, "isTTY", ORIGINAL_STDIN_TTY);
-  } else {
-    Reflect.deleteProperty(process.stdin, "isTTY");
-  }
-  if (ORIGINAL_STDOUT_TTY) {
-    Object.defineProperty(process.stdout, "isTTY", ORIGINAL_STDOUT_TTY);
-  } else {
-    Reflect.deleteProperty(process.stdout, "isTTY");
-  }
-}
+const { set: setTty, restore: restoreTty } = createCliTtyMock();
 
 function createTrackedPluginConfig(params: {
   pluginId: string;
@@ -846,7 +822,12 @@ describe("plugins cli update", () => {
     pluginLifecycleGatewayMock.mockImplementation(async (...args: unknown[]) => {
       const [method] = args;
       expect(held).toBe(false);
-      return method === "plugins.refresh" ? { runtime: { generation: 7 } } : {};
+      return method === "plugins.refresh"
+        ? {
+            runtime: { generation: 7 },
+            warnings: ["Previous plugin service could not stop."],
+          }
+        : {};
     });
     try {
       await runPluginsCommand(["plugins", "update", "brave"]);
@@ -854,6 +835,9 @@ describe("plugins cli update", () => {
         "plugins.list",
         "plugins.refresh",
       ]);
+      expect(pluginsCliRuntimeLogs).toContainEqual(
+        expect.stringContaining("Previous plugin service could not stop."),
+      );
       expect(pluginsCliRuntimeLogs).toContain("Applied plugin updates in Gateway generation 7.");
     } finally {
       spy.mockRestore();

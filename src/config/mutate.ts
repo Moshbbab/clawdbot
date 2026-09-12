@@ -54,6 +54,7 @@ import {
   rejectConfigNonFiniteNumbers,
   resolveManagedRuntimeEnvBaseline,
 } from "./io.read-helpers.js";
+import { configWriteCommittedSnapshot } from "./io.types.js";
 import { ConfigWritePostCommitError, type ConfigWriteRollbackStatus } from "./io.write-errors.js";
 import { injectExplicitlySetPaths, projectConfigWriteSource } from "./io.write-prepare.js";
 import { warnIfJSON5CommentsWillBeStripped } from "./json5-comments.js";
@@ -247,6 +248,9 @@ async function readConfigSnapshotForMutation(params: {
       configPath: params.ownedConfigPathForWrite,
       ...(params.writeOptions?.skipPluginValidation ? { pluginValidation: "skip" as const } : {}),
       ...(params.writeOptions?.observe === false ? { observe: false } : {}),
+      ...(params.writeOptions?.preservedLegacyRootKeys
+        ? { preservedLegacyRootKeys: params.writeOptions.preservedLegacyRootKeys }
+        : {}),
     };
     const io = hasManagedRuntimeConfigWriteOwner(params.ownedConfigPathForWrite)
       ? createConfigIO({
@@ -1101,13 +1105,6 @@ async function tryWriteIncludeOwnedConfigMutation(params: {
   );
 }
 
-function resolveConfigWriteResult(
-  result: ConfigWriteResult | void,
-  fallbackConfig: OpenClawConfig,
-): ConfigMutationWriteResult {
-  return result ?? { persistedHash: null, persistedConfig: fallbackConfig };
-}
-
 export type ConfigReplaceInput =
   | { sourceConfig: OpenClawConfig; nextConfig?: never }
   | { nextConfig: OpenClawConfig; sourceConfig?: never };
@@ -1199,10 +1196,16 @@ async function replaceConfigFileUnlocked(
         await ioPreCommitRuntimePreflight?.(sourceConfig);
       };
     }
-    writeResult = resolveConfigWriteResult(
-      await (params.io?.writeConfigFile ?? writeConfigFile)(nextConfig, fallbackWriteOptions),
+    const written = await (params.io?.writeConfigFile ?? writeConfigFile)(
       nextConfig,
+      fallbackWriteOptions,
     );
+    const committed = written?.[configWriteCommittedSnapshot];
+    writeResult = {
+      persistedHash: committed?.hash ?? written?.persistedHash ?? null,
+      persistedConfig: committed?.sourceConfig ?? written?.persistedConfig ?? nextConfig,
+      persistedSourceConfig: written?.persistedSourceConfig,
+    };
   }
   return {
     path: snapshot.path,
